@@ -1,0 +1,343 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: 'AWS::Serverless-2016-10-31'
+Description: An AWS Serverless Specification template describing your function.
+Resources:
+  IterateTables:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: IterateTables/index.handler
+      Runtime: nodejs8.10
+      Description: ''
+      MemorySize: 128
+      Timeout: 15
+      Policies:
+        - AmazonSSMReadOnlyAccess
+        - AWSGlueServiceRole
+        - AWSStepFunctionsFullAccess
+  Crawl:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: Crawl/index.handler
+      Runtime: nodejs8.10
+      Description: ''
+      MemorySize: 512
+      Timeout: 35
+      Policies:
+        - AmazonAthenaFullAccess
+        - AmazonKinesisFirehoseFullAccess
+        - AmazonS3ReadOnlyAccess
+        - AmazonSSMReadOnlyAccess
+  GetCrawlerStatus:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: GetCrawlerStatus/index.handler
+      Runtime: nodejs8.10
+      Description: ''
+      MemorySize: 512
+      Timeout: 35
+      Policies:
+        - AmazonSSMReadOnlyAccess
+        - AWSGlueServiceRole
+  StartCrawler:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: StartCrawler/index.handler
+      Runtime: nodejs8.10
+      Description: ''
+      MemorySize: 128
+      Timeout: 15
+      Policies:
+        - AmazonSSMReadOnlyAccess
+        - AWSGlueServiceRole
+  CrawlerStepFunction:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      DefinitionString:
+        'Fn::Sub':
+          - |-
+            {
+              "StartAt": "GetCrawlerStatus",
+              "States": {
+                "GetCrawlerStatus": {
+                  "Type": "Task",
+                  "Resource": "${getCrawlerStatus}",
+                  "Next": "CheckCrawlerStatus"
+                },
+                "StartCrawler": {
+                  "Type": "Task",
+                  "Resource": "${startCrawler}",
+                  "Next": "WaitForCrawlerToFinish"
+                },
+                "CheckCrawlerStatus": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.CrawlerState",
+                      "StringEquals": "READY",
+                      "Next": "CheckIfCrawlerAlreadyStarted"
+                    },
+                    {
+                      "Variable": "$.CrawlerState",
+                      "StringEquals": "RUNNING",
+                      "Next": "WaitForCrawlerToFinish"
+                    },
+                    {
+                      "Variable": "$.CrawlerState",
+                      "StringEquals": "STOPPING",
+                      "Next": "WaitForCrawlerToFinish"
+                    }
+                  ]
+                },
+                "CheckIfCrawlerAlreadyStarted": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.CrawlerStarted",
+                      "BooleanEquals": true,
+                      "Next": "StartCleaning"
+                    }
+                  ],
+                  "Default" : "StartCrawler"
+                },
+                "WaitForCrawlerToFinish": {
+                  "Type": "Wait",
+                  "Seconds": 10,
+                  "Next" : "GetCrawlerStatus" 
+                },
+                "StartCleaning": {
+                  "Type": "Task",
+                  "Resource": "${startCleaning}",
+                  "Next": "Done"
+                },
+                "Done": {
+                  "Type": "Pass",
+                  "End": true
+                }
+              }
+            }
+          - getCrawlerStatus:
+              'Fn::GetAtt':
+                - GetCrawlerStatus
+                - Arn
+            startCrawler:
+              'Fn::GetAtt':
+                - StartCrawler
+                - Arn
+            startCleaning:
+              'Fn::GetAtt':
+                - IterateTables
+                - Arn
+      RoleArn:
+        'Fn::GetAtt':
+          - StatesExecutionRole
+          - Arn
+  CleanerStepFunction:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      DefinitionString:
+        'Fn::Sub':
+          - |-
+            {
+              "StartAt": "ProcessRecords",
+              "States": {
+                "ProcessRecords": {
+                  "Type": "Task",
+                  "Resource": "${lambdaArn}",
+                  "Next": "CheckForMoreRecords"
+                },
+                "CheckForMoreRecords": {
+                  "Type": "Choice",
+                  "Choices": [
+                    {
+                      "Variable": "$.HasMoreRecords",
+                      "BooleanEquals": true,
+                      "Next": "ProcessRecords"
+                    }
+                  ],
+                  "Default": "Done"
+                },
+                "Done": {
+                  "Type": "Pass",
+                  "End": true
+                }
+              }
+            }
+          - lambdaArn:
+              'Fn::GetAtt':
+                - Crawl
+                - Arn
+      RoleArn:
+        'Fn::GetAtt':
+          - StatesExecutionRole
+          - Arn
+  StatesExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - 'Fn::Sub': 'states.${AWS::Region}.amazonaws.com'
+            Action: 'sts:AssumeRole'
+      Path: /
+      Policies:
+        - PolicyName: StatesExecutionPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'lambda:InvokeFunction'
+                Resource: '*'
+  Deliverystream:
+    Type: 'AWS::KinesisFirehose::DeliveryStream'
+    Properties:
+      ExtendedS3DestinationConfiguration:
+        BucketARN:
+          'Fn::Join':
+            - ''
+            - - 'arn:aws:s3:::'
+              - Ref: s3CleanBucket
+        BufferingHints:
+          IntervalInSeconds: '60'
+          SizeInMBs: '50'
+        CompressionFormat: UNCOMPRESSED
+        Prefix: data/
+        RoleARN:
+          'Fn::GetAtt':
+            - deliveryRole
+            - Arn
+  s3RawBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName:
+        'Fn::Sub': 'raw-data-${AWS::AccountId}'
+  s3CleanBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName:
+        'Fn::Sub': 'clean-data-${AWS::AccountId}'
+  deliveryRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: 'sts:AssumeRole'
+            Condition:
+              StringEquals:
+                'sts:ExternalId':
+                  Ref: 'AWS::AccountId'
+      Policies:
+        - PolicyName: CrawlBucketPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:*'
+                Resource:
+                  - 'Fn::Sub': 'arn:aws:s3:::${s3CleanBucket}'
+                  - 'Fn::Sub': 'arn:aws:s3:::${s3CleanBucket}*'
+  GlueDatabase:
+    Type: 'AWS::Glue::Database'
+    Properties:
+      DatabaseInput:
+        Name: raw-db
+      CatalogId:
+        Ref: 'AWS::AccountId'
+  GlueCrawler:
+    Type: 'AWS::Glue::Crawler'
+    Properties:
+      Role:
+        'Fn::GetAtt':
+          - CrawlerRole
+          - Arn
+      SchemaChangePolicy:
+        UpdateBehavior: UPDATE_IN_DATABASE
+        DeleteBehavior: DELETE_FROM_DATABASE
+      DatabaseName:
+        Ref: GlueDatabase
+      Targets:
+        S3Targets:
+          - Path:
+              'Fn::Sub': 's3://${s3RawBucket}/'
+      Name: raw-crawler
+  CrawlerRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: ''
+            Effect: Allow
+            Principal:
+              Service: glue.amazonaws.com
+            Action: 'sts:AssumeRole'
+      Policies:
+        - PolicyName: CrawlBucketPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:AbortMultipartUpload'
+                  - 's3:GetBucketLocation'
+                  - 's3:GetObject'
+                  - 's3:ListBucket'
+                  - 's3:ListBucketMultipartUploads'
+                  - 's3:PutObject'
+                Resource:
+                  - 'Fn::Sub': 'arn:aws:s3:::${s3RawBucket}'
+                  - 'Fn::Sub': 'arn:aws:s3:::${s3RawBucket}*'
+  CrawlerNameParameter:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: /Cleaner/CrawlerName
+      Type: String
+      Value:
+        Ref: GlueCrawler
+  CleanerStateMachineParameter:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: /Cleaner/CleanerStateMachineArn
+      Type: String
+      Value:
+        Ref: CleanerStepFunction
+  CleanderGlueDatabaseNameParameter:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: /Cleaner/GlueDatabaseName
+      Type: String
+      Value:
+        Ref: GlueDatabase
+  QueryOutputLocationParameter:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: /Cleaner/QueryOutputLocation
+      Type: String
+      Value:
+        'Fn::Sub': 's3://aws-athena-query-results-${AWS::AccountId}-${AWS::Region}/'
+  DeliverystreamParameter:
+    Type: 'AWS::SSM::Parameter'
+    Properties:
+      Name: /Cleaner/DeliveryStreamName
+      Type: String
+      Value:
+        Ref: Deliverystream
+  LoadTestData:
+    Type: 'AWS::Serverless::Function'
+    Properties:
+      Handler: LoadTestData/index.handler
+      Runtime: nodejs8.10
+      Description: ''
+      MemorySize: 128
+      Timeout: 30

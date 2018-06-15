@@ -1,0 +1,8 @@
+{
+    "StartCrawler": {
+        "lambda": {}
+    },
+    "GetCrawlerStatus": {
+        "lambda": {}
+    }
+}

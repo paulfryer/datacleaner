@@ -1,0 +1,8 @@
+{
+    "Crawl": {
+        "lambda": {
+            TableName: "index"
+            
+        }
+    }
+}
