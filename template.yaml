@@ -213,12 +213,12 @@ Resources:
     Type: 'AWS::S3::Bucket'
     Properties:
       BucketName:
-        'Fn::Sub': 'raw-data-${AWS::AccountId}'
+        'Fn::Sub': 'raw-data-${AWS::AccountId}-${AWS::Region}'
   s3CleanBucket:
     Type: 'AWS::S3::Bucket'
     Properties:
       BucketName:
-        'Fn::Sub': 'clean-data-${AWS::AccountId}'
+        'Fn::Sub': 'clean-data-${AWS::AccountId}-${AWS::Region}'
   deliveryRole:
     Type: 'AWS::IAM::Role'
     Properties:
